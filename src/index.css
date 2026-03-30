@@ -1,0 +1,33 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  @apply bg-gray-50 text-gray-900;
+}
+
+/* ── Print styles ── */
+@media print {
+  @page {
+    size: A4;
+    margin: 10mm;
+  }
+
+  .no-print {
+    display: none !important;
+  }
+
+  nav, header {
+    display: none !important;
+  }
+
+  body {
+    background: white !important;
+    font-size: 11px;
+  }
+
+  /* Ensure page breaks work */
+  .page-break {
+    page-break-before: always;
+  }
+}
