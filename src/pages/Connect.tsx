@@ -112,8 +112,13 @@ export default function Connect() {
     if (decoded?.weight) {
       setLiveWeight(decoded.weight)
       
-      // TRAVA DE SEGURANÇA: Só processa bioimpedância se o peso for > 30kg
-      if (decoded.weight > 30 && decoded.fatPercent && decoded.fatPercent > 0) {
+      // LOG DE DEPURAÇÃO: Vamos ver o que está causando a finalização
+      if (decoded.fatPercent && decoded.fatPercent > 0) {
+        console.log(`[DEBUG] Peso: ${decoded.weight}kg, Gordura: ${decoded.fatPercent}%, Impedância: ${decoded.impedances?.rightLeg20} Ohms`)
+      }
+
+      // TRAVA DE SEGURANÇA REFORÇADA: Só processa bioimpedância se o peso for > 40kg
+      if (decoded.weight > 40 && decoded.fatPercent && decoded.fatPercent > 0) {
         console.log('[CONNECT] Bioimpedância Real Detectada! Finalizando agora...')
         await saveMeasurementAndNavigate(decoded)
         return
