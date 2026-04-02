@@ -25,7 +25,7 @@ function dataViewToBytes(dv: DataView): number[] {
 }
 
 export default function Connect() {
-  const { activeProfileId, profiles, bleStatus, setBLEStatus, saveMeasurement } = useStore()
+  const { activeProfileId, profiles, bleStatus, setBLEStatus, saveMeasurement, setLastMeasurement } = useStore()
   const navigate = useNavigate()
   const bleRef = useRef<BLEService | null>(null)
 
@@ -37,16 +37,22 @@ export default function Connect() {
   const measurementSavedRef   = useRef(false)
   const profileRef            = useRef(profiles.find(p => p.id === activeProfileId))
   
-  // Estabilidade e Captura Prioritária
+  // Refs para controle de estado e estabilidade
   const lastWeightRef         = useRef<number | null>(null)
   const stabilityTimerRef     = useRef<ReturnType<typeof setTimeout> | null>(null)
   const bestMeasurementRef    = useRef<Partial<Measurement> | null>(null)
+  const mountedRef            = useRef(false)
+  const savingRef             = useRef(false)
+  const weightOnlyCountRef    = useRef(0)
+  const connectedAtRef        = useRef<number | null>(null)
+  const seenLowWeightRef      = useRef(false)
 
   const profile = profiles.find(p => p.id === activeProfileId)
   profileRef.current = profile
 
   const saveMeasurementAndNavigate = useCallback(async (decoded: Partial<Measurement>) => {
-    if (!profileRef.current || !decoded.weight || measurementSavedRef.current) return
+    if (!profileRef.current || !decoded.weight || measurementSavedRef.current || savingRef.current) return
+    savingRef.current = true
     measurementSavedRef.current = true
     
     if (stabilityTimerRef.current) {
@@ -68,9 +74,11 @@ export default function Connect() {
       muscleMass:      decoded.muscleMass ?? 0,
       musclePercent:   decoded.musclePercent ?? 0,
       boneMass:        decoded.boneMass ?? 0,
-      proteinMass:     0, proteinPercent: 0,
+      proteinMass:     decoded.proteinMass ?? 0,
+      proteinPercent:  decoded.proteinPercent ?? 0,
       visceralFat:     decoded.visceralFat ?? 0,
-      metabolicAge:    0, bmr: decoded.bmr ?? 0,
+      metabolicAge:    decoded.metabolicAge ?? 0,
+      bmr:             decoded.bmr ?? 0,
       impedances:      decoded.impedances ?? {
         rightArm20: 0, rightArm100: 0, leftArm20: 0, leftArm100: 0,
         trunk20: 0, trunk100: 0, rightLeg20: 0, rightLeg100: 0,
@@ -80,10 +88,11 @@ export default function Connect() {
     }
     try {
       await saveMeasurement(measurement)
-      navigate('/result')
+      if (mountedRef.current) navigate('/result')
     } catch (err: unknown) {
       setError('Erro ao salvar: ' + (err instanceof Error ? err.message : String(err)))
       measurementSavedRef.current = false
+      savingRef.current = false
     }
   }, [saveMeasurement, navigate])
 
@@ -98,23 +107,19 @@ export default function Connect() {
     const p = profileRef.current
     if (!p) return
 
-    // 1. Tenta decodificar composição corporal completa em cada pacote
     const decoded = decodeBodyPacket(bytes, { height: p.height, sex: p.sex, age: p.age })
     
     if (decoded?.weight) {
       setLiveWeight(decoded.weight)
       
-      // Se detectamos gordura/água real (fatPercent > 0), finalizamos IMEDIATAMENTE
       if (decoded.fatPercent && decoded.fatPercent > 0) {
         console.log('[CONNECT] Bioimpedância Real Detectada! Finalizando agora...')
         await saveMeasurementAndNavigate(decoded)
         return
       }
 
-      // Se for apenas peso, guardamos como "melhor medição até agora"
       bestMeasurementRef.current = decoded
 
-      // Lógica de Estabilidade (20s) como fallback
       if (decoded.weight === lastWeightRef.current) {
         if (!stabilityTimerRef.current && !measurementSavedRef.current) {
           stabilityTimerRef.current = setTimeout(async () => {
@@ -144,21 +149,31 @@ export default function Connect() {
   }, [])
 
   useEffect(() => {
+    mountedRef.current = true
+    setLastMeasurement(null)
     const bleService = new BLEService(
-      (status) => setBLEStatus(status),
+      (status) => {
+        if (status === 'connected') connectedAtRef.current = Date.now()
+        setBLEStatus(status)
+      },
       handleDataReceived,
       handleDiscovery
     )
     bleRef.current = bleService
     return () => { 
+      mountedRef.current = false
       if (bleRef.current) bleRef.current.disconnect()
       if (stabilityTimerRef.current) clearTimeout(stabilityTimerRef.current)
     }
-  }, [handleDataReceived, handleDiscovery, setBLEStatus])
+  }, [handleDataReceived, handleDiscovery, setBLEStatus, setLastMeasurement])
 
   async function handleScan() {
-    setError(''); setPackets([]); setLiveWeight(null); measurementSavedRef.current = false
+    setError(''); setPackets([]); setLiveWeight(null)
+    measurementSavedRef.current = false; savingRef.current = false
     lastWeightRef.current = null; bestMeasurementRef.current = null
+    weightOnlyCountRef.current = 0; connectedAtRef.current = null; seenLowWeightRef.current = false
+    setLastMeasurement(null)
+    
     const abortController = new AbortController()
     try {
       await bleRef.current?.scanAll(abortController.signal)
