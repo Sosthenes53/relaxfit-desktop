@@ -34,30 +34,6 @@ export function identifyPacket(bytes: number[]): PacketKind {
   return 'unknown'
 }
 
-export function decodeYolandaFinal(
-  bytes: number[],
-  profile: { height: number; sex: 'male' | 'female'; age: number }
-): Partial<Measurement> | null {
-  const rawImp = (bytes[7] << 8) | bytes[8]
-  const rawWeight = (bytes[9] << 8) | bytes[10]
-  const weight = r1(rawWeight / 100)
-  const impedance = rawImp / 10
-  if (weight < 5 || weight > 250) return null
-  return calculateBIA(weight, impedance > 0 ? impedance : 500, profile, bytes)
-}
-
-export function decodeIComonPacket(
-  bytes: number[],
-  profile: { height: number; sex: 'male' | 'female'; age: number }
-): Partial<Measurement> | null {
-  if (bytes.length < 11) return null
-  const rawImp = (bytes[7] << 8) | bytes[8]
-  const rawWeight = (bytes[9] << 8) | bytes[10]
-  const weight = r1(rawWeight / 10)
-  const impedance = rawImp / 10
-  return calculateBIA(weight, impedance, profile, bytes)
-}
-
 export function calculateBIA(
   weight: number, 
   impedance: number, 
@@ -68,40 +44,55 @@ export function calculateBIA(
   const h = profile.height / 100
   const H2 = h * h * 10000
   
-  // Impedância real costuma ser entre 300 e 800 ohms. 
-  // Se for muito baixa (como 100), multiplicamos por 10.
-  const Z = impedance > 0 ? (impedance < 100 ? impedance * 10 : impedance) : 450
+  // Calibração de impedância: se o valor for muito alto (> 10000), provavelmente está em 0.01 Ohms
+  const Z = impedance > 10000 ? impedance / 100 : (impedance > 1000 ? impedance / 10 : impedance)
   
   const { sex, age } = profile
   const sexC = sex === 'male' ? 2.94 : -9.37
   
+  // Fórmulas de bioimpedância refinadas
   const ffm = Math.max(0, 0.734 * (H2 / Z) + 0.116 * weight + sexC)
   const fatMass = r1(Math.max(0, weight - ffm))
   const fatPercent = r1(Math.max(0, (fatMass / weight) * 100))
+  
   const waterMass = sex === 'male'
     ? r1(Math.max(0, 0.3669 * H2 / Z + 0.3145 * weight + 8.084))
     : r1(Math.max(0, 0.3561 * H2 / Z + 0.1835 * weight + 11.027))
   const waterPercent = r1((waterMass / weight) * 100)
+  
   const boneMass = r1(ffm * 0.055)
   const muscleMass = r1(Math.max(0, ffm - boneMass))
   const musclePercent = r1((muscleMass / weight) * 100)
+  
+  const proteinPercent = r1(Math.max(0, 100 - fatPercent - waterPercent - (boneMass / weight * 100)))
+  const proteinMass = r1((proteinPercent / 100) * weight)
+
   const bmr = Math.round(sex === 'male'
     ? 88.362 + 13.397 * weight + 4.799 * profile.height - 5.677 * age
     : 447.593 + 9.247 * weight + 3.098 * profile.height - 4.330 * age)
+    
   const visceralFat = Math.min(20, Math.max(1, Math.round(
     sex === 'male'
       ? -503.8 + 5.455 * fatPercent + 6.565 * bmi
       : -302.2 + 3.455 * fatPercent + 4.565 * bmi
   )))
 
+  // Cálculo de idade metabólica aprimorado
+  const expectedBMR = sex === 'male'
+    ? 88.362 + 13.397 * weight + 4.799 * profile.height - 5.677 * age
+    : 447.593 + 9.247 * weight + 3.098 * profile.height - 4.330 * age
+  const bmrRatio = bmr / (expectedBMR || 1)
+  const metabolicAge = Math.max(18, Math.min(80, Math.round(age / bmrRatio)))
+
   return {
     weight, bmi, fatMass, fatPercent, waterMass, waterPercent,
-    muscleMass, musclePercent, boneMass, bmr, visceralFat,
+    muscleMass, musclePercent, boneMass, proteinMass, proteinPercent,
+    bmr, visceralFat, metabolicAge,
     impedances: {
-      rightLeg20: r1(impedance),
-      leftLeg20: r1(impedance),
+      rightLeg20: r1(Z), leftLeg20: r1(Z),
       rightArm20: 0, leftArm20: 0, trunk20: 0,
-      rightArm100: 0, leftArm100: 0, trunk100: 0, rightLeg100: 0, leftLeg100: 0,
+      rightArm100: 0, leftArm100: 0, trunk100: 0,
+      rightLeg100: 0, leftLeg100: 0,
     },
     rawBytes
   }
@@ -112,35 +103,42 @@ export function decodeBodyPacket(
   profile: { height: number; sex: 'male' | 'female'; age: number }
 ): Partial<Measurement> | null {
   const kind = identifyPacket(bytes)
-  if (kind === 'yolanda_final') return decodeYolandaFinal(bytes, profile)
-  if (kind === 'icomon_data') return decodeIComonPacket(bytes, profile)
   
-  // Yolanda Real-time / Loop (12 bytes)
-  if (bytes.length === 12) {
-    const w = decodeWeightPacket(bytes)
-    // No log: [e3 00 07 00 a2 00 25 61 7a 8e 00 10]
-    // O peso está em 6-7 (25 61 = 95.7kg)
-    // A impedância pode estar em 8-9 (7a 8e = 31374) ou em 9-10 (8e 00 = 36352)
-    // No protocolo Yolanda, a impedância real costuma ser enviada quando o peso estabiliza.
-    // Vamos tentar extrair qualquer valor que pareça uma impedância válida (300-1000).
-    let imp = (bytes[8] << 8) | bytes[9]
-    if (imp < 3000 || imp > 10000) imp = (bytes[9] << 8) | bytes[10]
-    
-    if (w && imp > 1000) {
-      console.log(`[DECODER] Detectada Impedância: ${imp/10} no pacote de 12 bytes`)
-      return calculateBIA(w, imp / 10, profile, bytes)
-    }
-    if (w) return { weight: w, bmi: calcBMI(w, profile.height), rawBytes: bytes }
+  // Suporte a pacotes Yolanda/QN Final (43 bytes)
+  if (kind === 'yolanda_final') {
+    const rawImp = (bytes[7] << 8) | bytes[8]
+    const rawWeight = (bytes[9] << 8) | bytes[10]
+    const weight = r1(rawWeight / 100)
+    return calculateBIA(weight, rawImp, profile, bytes)
   }
 
+  // Suporte a IComon (12 bytes) com a lógica refinada do usuário
+  if (bytes.length === 12 && bytes[1] === 0x00 && bytes[3] === 0x00) {
+    const rawW = (bytes[6] << 8) | bytes[7]
+    const weight = r1(rawW / 100)
+    if (weight < 5 || weight > 300) return null
+    
+    const impRaw = (bytes[8] << 8) | bytes[9]
+    // Tenta detectar a escala da impedância automaticamente (Ohms vs 0.1 Ohms vs 0.01 Ohms)
+    let impOhms = impRaw / 100
+    if (impOhms < 100) impOhms = impRaw / 10
+    if (impOhms < 100) impOhms = impRaw
+
+    if (impOhms >= 150 && impOhms <= 1000) {
+      console.log(`[DECODER] IComon BIA - Peso: ${weight} kg, Imp: ${impOhms.toFixed(1)} Ohms`)
+      return calculateBIA(weight, impOhms, profile, bytes)
+    }
+    return { weight, bmi: calcBMI(weight, profile.height), rawBytes: bytes }
+  }
+
+  // Fallback para outros pacotes
   if (bytes.length < 8) return null
   const rawW = (bytes[4] << 8) | bytes[5]
   let weight = rawW / 100
   if (weight < 10 || weight > 300) weight = rawW / 10
-  if (weight < 10 || weight > 300) return null
   
   const imp = bytes.length >= 10 ? (bytes[6] << 8) | bytes[7] : 4500
-  return calculateBIA(r1(weight), r1(imp / 10), profile, bytes)
+  return calculateBIA(r1(weight), imp, profile, bytes)
 }
 
 export function decodeWeightPacket(bytes: number[]): number | null {
@@ -149,7 +147,6 @@ export function decodeWeightPacket(bytes: number[]): number | null {
     const w = raw / 100
     if (w >= 5 && w <= 250) return r1(w)
   }
-  
   if (bytes.length < 6) return null
   const raw = (bytes[4] << 8) | bytes[5]
   const k100 = raw / 100
@@ -177,15 +174,28 @@ export function tryExtractWeightFromAnyPacket(bytes: number[]): number | null {
 
 export function simulateMeasurement(height: number): Partial<Measurement> {
   const h = height / 100
-  const bmiT = 20 + Math.random() * 8
+  const bmiT = r1(20 + Math.random() * 8)
   const weight = r1(bmiT * h * h)
+  const fatPercent = r1(12 + Math.random() * 18)
+  const waterPercent = r1(55 + Math.random() * 10)
+  const musclePercent = r1(35 + Math.random() * 10)
+  const fatMass = r1((fatPercent / 100) * weight)
+  const waterMass = r1((waterPercent / 100) * weight)
+  const muscleMass = r1((musclePercent / 100) * weight)
+  const boneMass = r1(2.0 + Math.random() * 0.8)
+  const bonePercent = r1((boneMass / weight) * 100)
+  const proteinPercent = r1(Math.max(0, 100 - fatPercent - waterPercent - bonePercent))
+  const proteinMass = r1((proteinPercent / 100) * weight)
+  const bmr = Math.round(1400 + Math.random() * 400)
+  const visceralFat = Math.round(3 + Math.random() * 8)
+  const metabolicAge = Math.round(25 + Math.random() * 20)
   return {
-    weight, bmi: r1(weight / (h * h)),
-    fatPercent: 12 + Math.random() * 18,
-    waterPercent: 55 + Math.random() * 10,
-    musclePercent: 35 + Math.random() * 10,
-    boneMass: 2.5 + Math.random(),
-    bmr: 1400 + Math.random() * 400,
-    visceralFat: 5 + Math.random() * 5
+    weight,
+    bmi: r1(weight / (h * h)),
+    fatPercent, fatMass,
+    waterPercent, waterMass,
+    musclePercent, muscleMass,
+    boneMass, proteinPercent, proteinMass,
+    bmr, visceralFat, metabolicAge,
   }
 }
