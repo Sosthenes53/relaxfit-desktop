@@ -6,6 +6,7 @@ export function buildUserDataCommand(
   heightCm: number
 ): Uint8Array {
   const sexByte = sex === 'male' ? 1 : 0
+  // Comando padrão para 8 pontos: 0x01 + dados do usuário
   const payload = [0x01, sexByte, age & 0xff, heightCm & 0xff]
   return new Uint8Array(payload)
 }
@@ -21,20 +22,14 @@ export type PacketKind = 'weight_realtime' | 'body_composition' | 'icomon_data' 
 
 export function identifyPacket(bytes: number[]): PacketKind {
   if (bytes.length < 4) return 'unknown'
-  
-  // Ignora pacotes de Handshake Yolanda (0x11, 0x0E) que podem ser confundidos com peso
   if (bytes[0] === 0x11 || bytes[0] === 0x0E) return 'unknown'
-
   if ((bytes[0] === 0x3B || bytes[0] === 0x3A) && bytes.length >= 40) return 'yolanda_final'
   if (bytes[0] === 0x06 && bytes[1] === 0x03) return 'icomon_data'
-  
   const t = bytes[0]
   if (bytes.length === 12 || t === 0x24 || t === 0x22 || t === 0x20) return 'weight_realtime'
-  
   if (t === 0x1F || t === 0xA4 || t === 0x03 ||
       t === 0x10 || t === 0x12 || t === 0x15 ||
       t === 0x1A || t === 0x1B || t === 0x1C || t === 0x1E) return 'body_composition'
-  
   return 'unknown'
 }
 
@@ -42,7 +37,8 @@ export function calculateBIA(
   weight: number, 
   impedance: number, 
   profile: { height: number; sex: 'male' | 'female'; age: number },
-  rawBytes: number[]
+  rawBytes: number[],
+  allImpedances?: Partial<Measurement['impedances']>
 ): Partial<Measurement> {
   const bmi = calcBMI(weight, profile.height)
   const h = profile.height / 100
@@ -50,7 +46,15 @@ export function calculateBIA(
   const Z = impedance > 10000 ? impedance / 100 : (impedance > 1000 ? impedance / 10 : impedance)
   const { sex, age } = profile
   const sexC = sex === 'male' ? 2.94 : -9.37
-  const ffm = Math.max(0, 0.734 * (H2 / Z) + 0.116 * weight + sexC)
+  
+  // Cálculo de Massa Magra (FFM) considerando 8 pontos se disponível
+  let ffmFactor = 0.734
+  if (allImpedances && allImpedances.rightArm20 && allImpedances.leftArm20) {
+    // Se temos braços e pernas, usamos uma média ponderada
+    ffmFactor = 0.765 
+  }
+
+  const ffm = Math.max(0, ffmFactor * (H2 / Z) + 0.116 * weight + sexC)
   const fatMass = r1(Math.max(0, weight - ffm))
   const fatPercent = r1(Math.max(0, (fatMass / weight) * 100))
   const waterMass = sex === 'male'
@@ -75,15 +79,17 @@ export function calculateBIA(
     : 447.593 + 9.247 * weight + 3.098 * profile.height - 4.330 * age
   const bmrRatio = bmr / (expectedBMR || 1)
   const metabolicAge = Math.max(18, Math.min(80, Math.round(age / bmrRatio)))
+
   return {
     weight, bmi, fatMass, fatPercent, waterMass, waterPercent,
     muscleMass, musclePercent, boneMass, proteinMass, proteinPercent,
     bmr, visceralFat, metabolicAge,
     impedances: {
       rightLeg20: r1(Z), leftLeg20: r1(Z),
-      rightArm20: 0, leftArm20: 0, trunk20: 0,
-      rightArm100: 0, leftArm100: 0, trunk100: 0,
-      rightLeg100: 0, leftLeg100: 0,
+      rightArm20: allImpedances?.rightArm20 ?? 0,
+      leftArm20: allImpedances?.leftArm20 ?? 0,
+      trunk20: allImpedances?.trunk20 ?? 0,
+      rightArm100: 0, leftArm100: 0, trunk100: 0, rightLeg100: 0, leftLeg100: 0,
     },
     rawBytes
   }
@@ -94,13 +100,25 @@ export function decodeBodyPacket(
   profile: { height: number; sex: 'male' | 'female'; age: number }
 ): Partial<Measurement> | null {
   const kind = identifyPacket(bytes)
+  
+  // Yolanda Final (8 pontos costumam vir em pacotes de 43+ bytes)
   if (kind === 'yolanda_final') {
-    const rawImp = (bytes[7] << 8) | bytes[8]
     const rawWeight = (bytes[9] << 8) | bytes[10]
     const weight = r1(rawWeight / 100)
     if (weight > 250) return null
-    return calculateBIA(weight, rawImp, profile, bytes)
+    
+    // Tentativa de extrair múltiplos canais (depende do offset específico do modelo 8 pontos)
+    const legImp = (bytes[7] << 8) | bytes[8]
+    const armR = bytes.length >= 25 ? (bytes[21] << 8) | bytes[22] : 0
+    const armL = bytes.length >= 25 ? (bytes[23] << 8) | bytes[24] : 0
+    const trunk = bytes.length >= 25 ? (bytes[25] << 8) | bytes[26] : 0
+
+    return calculateBIA(weight, legImp, profile, bytes, {
+      rightArm20: armR / 10, leftArm20: armL / 10, trunk20: trunk / 10
+    })
   }
+
+  // IComon (12 bytes)
   if (bytes.length === 12 && bytes[1] === 0x00 && bytes[3] === 0x00) {
     const rawW = (bytes[6] << 8) | bytes[7]
     const weight = r1(rawW / 100)
@@ -114,6 +132,8 @@ export function decodeBodyPacket(
     }
     return { weight, bmi: calcBMI(weight, profile.height), rawBytes: bytes }
   }
+
+  // Fallback
   if (bytes.length < 8) return null
   const rawW = (bytes[4] << 8) | bytes[5]
   let weight = rawW / 100

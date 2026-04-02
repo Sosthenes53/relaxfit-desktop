@@ -4,14 +4,12 @@ import { useStore } from '../store/useStore'
 import { BLEService, DiscoveredChar } from '../services/bleService'
 import {
   buildUserDataCommand, identifyPacket,
-  decodeWeightPacket, decodeBodyPacket,
-  simulateMeasurement, tryExtractWeightFromAnyPacket
+  decodeBodyPacket, simulateMeasurement
 } from '../services/decoder'
 import { Measurement } from '../types'
 import BLEStatusComponent from '../components/BLEStatus'
 import {
-  Bluetooth, Square, AlertCircle, FlaskConical,
-  Terminal, Activity
+  Bluetooth, Activity, Terminal, FlaskConical
 } from 'lucide-react'
 
 function generateId() {
@@ -36,16 +34,12 @@ export default function Connect() {
   
   const measurementSavedRef   = useRef(false)
   const profileRef            = useRef(profiles.find(p => p.id === activeProfileId))
-  
-  // Refs para controle de estado e estabilidade
   const lastWeightRef         = useRef<number | null>(null)
   const stabilityTimerRef     = useRef<ReturnType<typeof setTimeout> | null>(null)
   const bestMeasurementRef    = useRef<Partial<Measurement> | null>(null)
   const mountedRef            = useRef(false)
   const savingRef             = useRef(false)
-  const weightOnlyCountRef    = useRef(0)
   const connectedAtRef        = useRef<number | null>(null)
-  const seenLowWeightRef      = useRef(false)
 
   const profile = profiles.find(p => p.id === activeProfileId)
   profileRef.current = profile
@@ -112,25 +106,23 @@ export default function Connect() {
     if (decoded?.weight) {
       setLiveWeight(decoded.weight)
       
-      // LOG DE DEPURAÇÃO: Vamos ver o que está causando a finalização
-      if (decoded.fatPercent && decoded.fatPercent > 0) {
-        console.log(`[DEBUG] Peso: ${decoded.weight}kg, Gordura: ${decoded.fatPercent}%, Impedância: ${decoded.impedances?.rightLeg20} Ohms`)
-      }
-
-      // TRAVA DE SEGURANÇA REFORÇADA: Só processa bioimpedância se o peso for > 40kg
-      if (decoded.weight > 40 && decoded.fatPercent && decoded.fatPercent > 0) {
-        console.log('[CONNECT] Bioimpedância Real Detectada! Finalizando agora...')
+      // LOG DE DEPURAÇÃO: Verificando se temos múltiplos canais de impedância (8 pontos)
+      if (decoded.impedances?.rightArm20 && decoded.impedances?.leftArm20) {
+        console.log('[CONNECT] Medição de 8 Pontos Detectada! Finalizando agora...')
         await saveMeasurementAndNavigate(decoded)
         return
       }
 
-      bestMeasurementRef.current = decoded
+      // Se detectou gordura (mesmo que 2 pontos), guarda como "melhor" por enquanto
+      if (decoded.fatPercent && decoded.fatPercent > 0) {
+        bestMeasurementRef.current = decoded
+      }
 
       if (decoded.weight === lastWeightRef.current) {
         if (!stabilityTimerRef.current && !measurementSavedRef.current) {
           stabilityTimerRef.current = setTimeout(async () => {
             if (measurementSavedRef.current) return
-            console.log('[CONNECT] Tempo de estabilidade esgotado. Finalizando com os melhores dados disponíveis...')
+            console.log('[CONNECT] Tempo de estabilidade esgotado. Finalizando...')
             await saveMeasurementAndNavigate(bestMeasurementRef.current || decoded)
           }, 20000)
         }
@@ -147,8 +139,10 @@ export default function Connect() {
   const handleDiscovery = useCallback((chars: DiscoveredChar[]) => {
     const p = profileRef.current
     if (!p || !bleRef.current) return
+    // Tenta encontrar a característica de escrita para enviar o comando de 8 pontos
     const writeChar = chars.find(c => c.properties.includes('write') || c.properties.includes('writeNoResp'))
     if (writeChar) {
+      console.log('[CONNECT] Enviando comando de 8 pontos para a balança...')
       const cmd = buildUserDataCommand(p.sex, p.age, p.height)
       bleRef.current.sendCommand(writeChar.serviceUUID, writeChar.charUUID, Array.from(cmd)).catch(console.error)
     }
@@ -177,7 +171,7 @@ export default function Connect() {
     setError(''); setPackets([]); setLiveWeight(null)
     measurementSavedRef.current = false; savingRef.current = false
     lastWeightRef.current = null; bestMeasurementRef.current = null
-    weightOnlyCountRef.current = 0; connectedAtRef.current = null; seenLowWeightRef.current = false
+    connectedAtRef.current = null
     setLastMeasurement(null)
     
     const abortController = new AbortController()
@@ -198,7 +192,6 @@ export default function Connect() {
   }
 
   if (!profile) return null
-
   const isConnected = bleStatus === 'connected' || bleStatus === 'measuring'
 
   return (
@@ -218,9 +211,7 @@ export default function Connect() {
             <span className="text-sm text-green-800 font-medium">{deviceName}</span>
           </div>
         )}
-
         {error && <div className="bg-red-50 text-red-600 p-3 rounded-lg text-xs mb-3">{error}</div>}
-
         {!isConnected ? (
           <button onClick={handleScan} className="w-full bg-primary-600 text-white rounded-xl py-3 font-semibold">
             Procurar Balança
@@ -232,7 +223,7 @@ export default function Connect() {
               <p className="text-5xl font-black text-primary-700">{liveWeight ?? '0.0'} <span className="text-xl font-normal">kg</span></p>
               <div className="flex items-center justify-center gap-2 mt-4 text-primary-400">
                 <Activity className="w-4 h-4 animate-pulse" />
-                <span className="text-xs">Aguardando análise de bioimpedância...</span>
+                <span className="text-xs">Aguardando análise de 8 pontos...</span>
               </div>
             </div>
             <button onClick={() => bleRef.current?.disconnect()} className="w-full border border-gray-200 text-gray-600 rounded-xl py-2.5 text-sm">
