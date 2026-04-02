@@ -112,7 +112,8 @@ export default function Connect() {
     if (decoded?.weight) {
       setLiveWeight(decoded.weight)
       
-      if (decoded.fatPercent && decoded.fatPercent > 0) {
+      // TRAVA DE SEGURANÇA: Só processa bioimpedância se o peso for > 30kg
+      if (decoded.weight > 30 && decoded.fatPercent && decoded.fatPercent > 0) {
         console.log('[CONNECT] Bioimpedância Real Detectada! Finalizando agora...')
         await saveMeasurementAndNavigate(decoded)
         return
